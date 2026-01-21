@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - PROJECT_SERVICE_URL=http://project-service:8002
+      - CARBON_SERVICE_URL=http://carbon-service:8003
+      - MONITORING_SERVICE_URL=http://monitoring-service:8004
+    depends_on:
+      - auth-service
+      - project-service
+      - carbon-service
+      - monitoring-service
+    networks:
+      - ecoflow-network
+
+  auth-service:
+    build: ./auth-service
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=sqlite:///./auth.db
+      - SECRET_KEY=ecoflow-secret-key-dev
+    volumes:
+      - ./auth-service:/app
+    networks:
+      - ecoflow-network
+
+  project-service:
+    build: ./project-service
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=sqlite:///./projects.db
+    volumes:
+      - ./project-service:/app
+    networks:
+      - ecoflow-network
+
+  carbon-service:
+    build: ./carbon-service
+    ports:
+      - "8003:8003"
+    environment:
+      - DATABASE_URL=sqlite:///./carbon.db
+    volumes:
+      - ./carbon-service:/app
+    networks:
+      - ecoflow-network
+
+  monitoring-service:
+    build: ./monitoring-service
+    ports:
+      - "8004:8004"
+    environment:
+      - DATABASE_URL=sqlite:///./monitoring.db
+    volumes:
+      - ./monitoring-service:/app
+    networks:
+      - ecoflow-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - ecoflow-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - ecoflow-network
+
+networks:
+  ecoflow-network:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
