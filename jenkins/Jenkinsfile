@@ -1,0 +1,248 @@
+pipeline {
+    agent {
+        label 'docker'
+    }
+    
+    environment {
+        DOCKER_REGISTRY = 'localhost:5000'
+        K8S_NAMESPACE = 'ecoflow'
+        PROJECT_NAME = 'ecoflow'
+    }
+    
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'staging', 'production'],
+            description: 'Select deployment environment'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: 'Run tests before deployment'
+        )
+        booleanParam(
+            name: 'SKIP_LINT',
+            defaultValue: false,
+            description: 'Skip code linting'
+        )
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git --version'
+                echo "Building branch: ${env.GIT_BRANCH}"
+            }
+        }
+        
+        stage('Code Quality') {
+            when {
+                expression { params.SKIP_LINT == false }
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "Running code quality checks..."
+                        # Установка зависимостей для проверки кода
+                        pip install black flake8 mypy
+                        
+                        # Проверка форматирования
+                        black --check --diff .
+                        
+                        # Проверка стиля кода
+                        flake8 .
+                        
+                        # Проверка типов
+                        mypy --ignore-missing-imports api-gateway/ auth-service/ project-service/ carbon-service/ monitoring-service/
+                    '''
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            when {
+                expression { params.RUN_TESTS == true }
+            }
+            parallel {
+                stage('Test Auth Service') {
+                    steps {
+                        dir('auth-service') {
+                            sh '''
+                                pip install -r requirements.txt
+                                python -m pytest tests/ -v --cov=. --cov-report=xml
+                            '''
+                        }
+                    }
+                }
+                stage('Test Project Service') {
+                    steps {
+                        dir('project-service') {
+                            sh '''
+                                pip install -r requirements.txt
+                                python -m pytest tests/ -v --cov=. --cov-report=xml
+                            '''
+                        }
+                    }
+                }
+                stage('Test Carbon Service') {
+                    steps {
+                        dir('carbon-service') {
+                            sh '''
+                                pip install -r requirements.txt
+                                python -m pytest tests/ -v --cov=. --cov-report=xml
+                            '''
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    junit '**/test-results.xml'
+                    cobertura autoCoverageThresholds: [[failUnhealthy: false, failUnstable: false, method: 70, line: 80, class: 80, branch: 60, file: 80]], autoUpdateHealth: false, autoUpdateStability: false, coberturaReportFile: '**/coverage.xml', conditionalCoverageTargets: '70, 0, 0', failUnhealthy: false, failUnstable: false, lineCoverageTargets: '80, 0, 0', maxNumberOfBuilds: 0, methodCoverageTargets: '70, 0, 0', onlyStable: false, sourceEncoding: 'ASCII', zoomCoverageChart: false
+                }
+            }
+        }
+        
+        stage('Build Docker Images') {
+            steps {
+                script {
+                    def services = ['api-gateway', 'auth-service', 'project-service', 'carbon-service', 'monitoring-service']
+                    
+                    services.each { service ->
+                        echo "Building Docker image for ${service}"
+                        docker.build("${DOCKER_REGISTRY}/${service}:${env.BUILD_NUMBER}", "./${service}")
+                        docker.build("${DOCKER_REGISTRY}/${service}:latest", "./${service}")
+                    }
+                }
+            }
+        }
+        
+        stage('Push to Registry') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'docker-registry-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        sh """
+                            docker login ${DOCKER_REGISTRY} -u ${DOCKER_USER} -p ${DOCKER_PASS}
+                        """
+                        
+                        def services = ['api-gateway', 'auth-service', 'project-service', 'carbon-service', 'monitoring-service']
+                        
+                        services.each { service ->
+                            sh """
+                                docker push ${DOCKER_REGISTRY}/${service}:${env.BUILD_NUMBER}
+                                docker push ${DOCKER_REGISTRY}/${service}:latest
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                        sh """
+                            export KUBECONFIG=${KUBECONFIG}
+                            
+                            # Применяем namespace
+                            kubectl apply -f kubernetes/namespace.yaml
+                            
+                            # Обновляем образы в манифестах
+                            sed -i 's|image: .*/api-gateway:.*|image: ${DOCKER_REGISTRY}/api-gateway:${env.BUILD_NUMBER}|g' kubernetes/api-gateway-deployment.yaml
+                            sed -i 's|image: .*/auth-service:.*|image: ${DOCKER_REGISTRY}/auth-service:${env.BUILD_NUMBER}|g' kubernetes/auth-service-deployment.yaml
+                            sed -i 's|image: .*/project-service:.*|image: ${DOCKER_REGISTRY}/project-service:${env.BUILD_NUMBER}|g' kubernetes/project-service-deployment.yaml
+                            sed -i 's|image: .*/carbon-service:.*|image: ${DOCKER_REGISTRY}/carbon-service:${env.BUILD_NUMBER}|g' kubernetes/carbon-service-deployment.yaml
+                            sed -i 's|image: .*/monitoring-service:.*|image: ${DOCKER_REGISTRY}/monitoring-service:${env.BUILD_NUMBER}|g' kubernetes/monitoring-service-deployment.yaml
+                            
+                            # Применяем все манифесты
+                            kubectl apply -f kubernetes/ -n ${K8S_NAMESPACE}
+                            
+                            # Ждем развертывания
+                            kubectl rollout status deployment/api-gateway -n ${K8S_NAMESPACE} --timeout=300s
+                            kubectl rollout status deployment/auth-service -n ${K8S_NAMESPACE} --timeout=300s
+                            kubectl rollout status deployment/project-service -n ${K8S_NAMESPACE} --timeout=300s
+                            kubectl rollout status deployment/carbon-service -n ${K8S_NAMESPACE} --timeout=300s
+                            kubectl rollout status deployment/monitoring-service -n ${K8S_NAMESPACE} --timeout=300s
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                script {
+                    sh '''
+                        echo "Waiting for services to be ready..."
+                        sleep 30
+                        
+                        echo "Running integration tests..."
+                        # Проверка здоровья сервисов
+                        curl -f http://api-gateway.ecoflow.svc.cluster.local/health || exit 1
+                        
+                        # Тестирование основных эндпоинтов
+                        # (Здесь могут быть более сложные интеграционные тесты)
+                        python integration_tests.py
+                    '''
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "Running performance tests with k6..."
+                        # Установка k6
+                        apt-get update && apt-get install -y ca-certificates gnupg2
+                        apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+                        echo "deb https://dl.k6.io/deb stable main" | tee /etc/apt/sources.list.d/k6.list
+                        apt-get update && apt-get install -y k6
+                        
+                        # Запуск нагрузочных тестов
+                        k6 run --vus 10 --duration 30s performance_tests/api-gateway.js
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "Pipeline completed"
+            cleanWs()
+        }
+        success {
+            script {
+                def deployUrl = "http://ecoflow.local"
+                slackSend(
+                    channel: '#deployments',
+                    message: "✅ Deployment Successful!\nProject: ${PROJECT_NAME}\nEnvironment: ${params.DEPLOY_ENV}\nBuild: ${env.BUILD_NUMBER}\nURL: ${deployUrl}"
+                )
+            }
+        }
+        failure {
+            slackSend(
+                channel: '#deployments',
+                message: "❌ Deployment Failed!\nProject: ${PROJECT_NAME}\nEnvironment: ${params.DEPLOY_ENV}\nBuild: ${env.BUILD_NUMBER}\nJob: ${env.JOB_NAME}"
+            )
+        }
+        unstable {
+            slackSend(
+                channel: '#deployments',
+                message: "⚠️  Deployment Unstable\nProject: ${PROJECT_NAME}\nEnvironment: ${params.DEPLOY_ENV}\nBuild: ${env.BUILD_NUMBER}"
+            )
+        }
+    }
+}
